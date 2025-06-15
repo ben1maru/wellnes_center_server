@@ -15,9 +15,9 @@ const createAppointment = async (req, res, next) => {
 
     let parsedDateTime;
     if (typeof appointment_datetime === 'string') {
-        parsedDateTime = parseISO(appointment_datetime);
+        parsedDateTime = parseISO(appointment_datetime); // Parses '...Z' into a UTC-aware Date object
     } else if (appointment_datetime instanceof Date) {
-        parsedDateTime = appointment_datetime; // Вже об'єкт Date
+        parsedDateTime = appointment_datetime;
     } else {
         return res.status(400).json({ message: "Некоректний формат дати/часу запису." });
     }
@@ -26,6 +26,9 @@ const createAppointment = async (req, res, next) => {
          return res.status(400).json({ message: "Некоректна дата або час запису. Запис можливий лише на майбутній час." });
     }
     
+    // Format for MySQL DATETIME column (YYYY-MM-DD HH:MM:SS from UTC Date object)
+    const mysqlDateTime = parsedDateTime.toISOString().slice(0, 19).replace('T', ' ');
+
     const connection = await pool.getConnection();
     try {
         await connection.beginTransaction();
@@ -61,7 +64,7 @@ const createAppointment = async (req, res, next) => {
         }
 
         if (specialist_id) {
-            const appointmentStart = parsedDateTime;
+            const appointmentStart = parsedDateTime; // This is our UTC-aware Date object for the new appointment
             const appointmentEnd = addMinutes(appointmentStart, serviceDuration);
 
             const [overlappingAppointments] = await connection.query(
@@ -71,14 +74,25 @@ const createAppointment = async (req, res, next) => {
             );
             
             for (const existingApp of overlappingAppointments) {
-                let existingAppStart = existingApp.appointment_datetime;
-                if (!(existingAppStart instanceof Date)) {
-                    existingAppStart = parseISO(existingApp.appointment_datetime);
+                let existingAppStart;
+                // existingApp.appointment_datetime from DB will be like 'YYYY-MM-DD HH:MM:SS' (representing UTC)
+                if (existingApp.appointment_datetime instanceof Date) {
+                    // If driver already converted to Date, assume it's correct (ideally UTC)
+                    existingAppStart = existingApp.appointment_datetime;
+                } else if (typeof existingApp.appointment_datetime === 'string') {
+                    // Append 'Z' to the string from DB to parse it as UTC
+                    existingAppStart = parseISO(existingApp.appointment_datetime + 'Z');
+                } else {
+                    console.warn(`Unexpected type for existingApp.appointment_datetime: ${typeof existingApp.appointment_datetime}`);
+                    continue; // Skip if unparseable
                 }
-                 if (!isValid(existingAppStart)) continue; // Пропустити, якщо дата невалідная
+
+                if (!isValid(existingAppStart)) {
+                    console.warn(`Invalid date parsed for existing appointment: ${existingApp.appointment_datetime}`);
+                    continue; 
+                }
 
                 const existingAppEnd = addMinutes(existingAppStart, existingApp.duration_minutes);
-                // Перевірка на перетин: (StartA < EndB) and (EndA > StartB)
                 if (isBefore(appointmentStart, existingAppEnd) && isBefore(existingAppStart, appointmentEnd)) {
                     await connection.rollback();
                     connection.release();
@@ -89,7 +103,8 @@ const createAppointment = async (req, res, next) => {
         
         const [result] = await connection.query(
             'INSERT INTO appointments (user_id, specialist_id, service_id, appointment_datetime, duration_minutes, client_notes, status) VALUES (?, ?, ?, ?, ?, ?, ?)',
-            [user_id, specialist_id || null, service_id, formatISO(parsedDateTime), serviceDuration, client_notes || null, 'pending']
+            // Use the mysqlDateTime string for insertion
+            [user_id, specialist_id || null, service_id, mysqlDateTime, serviceDuration, client_notes || null, 'pending']
         );
         
         await connection.commit();
@@ -99,7 +114,8 @@ const createAppointment = async (req, res, next) => {
             user_id,
             specialist_id: specialist_id || null,
             service_id,
-            appointment_datetime: formatISO(parsedDateTime),
+            // For the response, send back the full ISO string (as the client sent)
+            appointment_datetime: formatISO(parsedDateTime), 
             duration_minutes: serviceDuration,
             status: 'pending',
             message: 'Запис успішно створено та очікує підтвердження.'
@@ -107,8 +123,10 @@ const createAppointment = async (req, res, next) => {
 
     } catch (error) {
         if (connection) await connection.rollback();
-        console.error("Помилка створення запису:", error);
-        next(error);
+        console.error("Помилка створення запису:", error); // Log the actual error
+        // Send a more generic message to the client for 500 errors or use error.message if safe
+        res.status(500).json({ message: error.sqlMessage || "Помилка на сервері при створенні запису." });
+        // next(error); // If you have a global error handler
     } finally {
         if (connection) connection.release();
     }
